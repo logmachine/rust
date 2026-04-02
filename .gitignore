@@ -4,4 +4,4 @@
 *.log*
 *versions*
 node_modules
-rust/target
+target

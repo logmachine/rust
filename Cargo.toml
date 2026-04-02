@@ -6,7 +6,7 @@ description = "Lightweight logging utility for distributed developers"
 license = "MIT"
 repository = "https://github.com/logmachine/rust"
 readme = "README.md"
-keywords = ["log", "logger", "logging", "debug", "collaborative", "tool", "developers", "centralized", "bufferpunk", "logmachine"]
+keywords = ["logger", "logging", "debug", "collaborative","logmachine"]
 categories = ["development-tools"]
 
 [lib]

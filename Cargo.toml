@@ -1,7 +1,13 @@
 [package]
 name = "logmachine"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
+description = "Lightweight logging utility for distributed developers"
+license = "MIT"
+repository = "https://github.com/logmachine/rust"
+readme = "README.md"
+keywords = ["log", "logger", "logging", "debug", "collaborative", "tool", "developers", "centralized", "bufferpunk", "logmachine"]
+categories = ["development-tools"]
 
 [lib]
 path = "main.rs"

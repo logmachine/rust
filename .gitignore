@@ -1,0 +1,7 @@
+*__pycache__*
+*-info*
+*dist*
+*.log*
+*versions*
+node_modules
+rust/target

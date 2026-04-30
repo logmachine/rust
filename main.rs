@@ -343,10 +343,11 @@ fn emit_central(
         let client = central_client.ok_or_else(|| {
             LogMachineError::Config("missing central HTTP client".to_string())
         })?;
-        let mut request = client.post(url).json(&log_data);
-        for (key, value) in &central.headers {
-            request = request.header(key, value);
-        }
+            let mut request = client.post(url).json(&log_data);
+            // Merge headers with potential lm_auth_token from credentials
+            for (key, value) in auth_headers(&central.headers).iter() {
+                request = request.header(key.as_str(), value.as_str());
+            }
 
         let response = request.send()?;
         if !response.status().is_success() {
@@ -364,7 +365,15 @@ fn emit_central(
 
 pub fn init_global_logger(options: LogMachineOptions) -> Result<(), LogMachineError> {
     if let Some(central) = &options.central {
+        // Load persisted credentials into environment (if present)
+        for (k, v) in load_lm_creds().into_iter() {
+            if !v.is_empty() {
+                env::set_var(k, v);
+            }
+        }
         resolve_username(&central.url);
+        // try to sync identity from session if token present
+        let _ = sync_identity_from_session(central);
     }
 
     let new_state = Arc::new(Mutex::new(LogMachineState::new(options)?));
@@ -443,6 +452,152 @@ pub fn jsonifier(log_file_path: &str) -> Result<Vec<String>, LogMachineError> {
     }
 
     Ok(entries)
+}
+
+// --- Credential helpers ---
+fn lm_creds_file_path() -> std::path::PathBuf {
+    let mut p = Path::new(&home_dir()).to_path_buf();
+    p.push(".logmachine");
+    p
+}
+
+fn load_lm_creds() -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let path = lm_creds_file_path();
+    if let Ok(s) = fs::read_to_string(&path) {
+        for line in s.lines() {
+            if let Some(idx) = line.find('=') {
+                let k = line[..idx].trim().to_string();
+                let v = line[idx + 1..].trim().to_string();
+                if !k.is_empty() {
+                    map.insert(k, v);
+                }
+            }
+        }
+    }
+    map
+}
+
+fn persist_lm_creds(username: &str, auth_token: &str, expiry: &str) -> std::io::Result<()> {
+    let mut current = load_lm_creds();
+    if !username.is_empty() {
+        current.insert("lm_username".to_string(), username.to_string());
+        current.insert("CL_USERNAME".to_string(), username.to_string());
+        env::set_var("lm_username", username);
+        env::set_var("CL_USERNAME", username);
+    }
+    if !auth_token.is_empty() {
+        current.insert("lm_auth_token".to_string(), auth_token.to_string());
+        env::set_var("lm_auth_token", auth_token);
+    }
+    if !expiry.is_empty() {
+        current.insert("lm_expiry".to_string(), expiry.to_string());
+        env::set_var("lm_expiry", expiry);
+    }
+
+    let mut lines = Vec::new();
+    for k in ["lm_username", "CL_USERNAME", "lm_auth_token", "lm_expiry"].iter() {
+        if let Some(v) = current.get(*k) {
+            if !v.is_empty() {
+                lines.push(format!("{}={}", k, v));
+            }
+        }
+    }
+    for (k, v) in current.iter() {
+        if ["lm_username", "CL_USERNAME", "lm_auth_token", "lm_expiry"].contains(&k.as_str()) {
+            continue;
+        }
+        if !v.is_empty() {
+            lines.push(format!("{}={}", k, v));
+        }
+    }
+    let content = if lines.is_empty() { String::new() } else { lines.join("\n") + "\n" };
+    fs::write(lm_creds_file_path(), content.as_bytes())
+}
+
+fn auth_headers(headers: &HashMap<String, String>) -> HashMap<String, String> {
+    let mut merged = HashMap::new();
+    for (k, v) in headers.iter() {
+        merged.insert(k.clone(), v.clone());
+    }
+    if let Ok(token) = env::var("lm_auth_token") {
+        if !token.trim().is_empty() {
+            let mut found = false;
+            for k in merged.keys() {
+                if k.eq_ignore_ascii_case("authorization") {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                merged.insert("Authorization".to_string(), format!("Bearer {}", token));
+            }
+        }
+    }
+    merged
+}
+
+fn token_expiry_is_valid() -> bool {
+    if let Ok(expiry) = env::var("lm_expiry") {
+        if expiry.trim().is_empty() {
+            return false;
+        }
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&expiry) {
+            return dt.signed_duration_since(chrono::Utc::now()) > chrono::Duration::zero();
+        }
+    }
+    if let Ok(expiry) = env::var("lm_auth_token_expiry") {
+        if expiry.trim().is_empty() {
+            return false;
+        }
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&expiry) {
+            return dt.signed_duration_since(chrono::Utc::now()) > chrono::Duration::zero();
+        }
+    }
+    false
+}
+
+fn sync_identity_from_session(central: &CentralConfig) -> Result<(), LogMachineError> {
+    if env::var("lm_auth_token").unwrap_or_default().trim().is_empty() {
+        return Ok(());
+    }
+    let session_url = match build_central_url(&central.url, "/api/auth/session") {
+        Ok(u) => u,
+        Err(_) => return Ok(()),
+    };
+    let client = build_central_client(Duration::from_secs(3)).build()?;
+    let mut req = client.get(session_url);
+    for (k, v) in auth_headers(&central.headers).iter() {
+        req = req.header(k.as_str(), v.as_str());
+    }
+    let resp = req.send()?;
+    if !resp.status().is_success() {
+        return Ok(());
+    }
+    if let Ok(payload) = resp.json::<serde_json::Value>() {
+        if let Some(user) = payload.get("user") {
+            if let Some(username) = user.get("username").and_then(|v| v.as_str()) {
+                let _ = persist_lm_creds(username, "", "");
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn login_with_api_key(central: &CentralConfig, api_key: &str) -> Result<(), LogMachineError> {
+    persist_lm_creds("", api_key, "").map_err(|e| LogMachineError::Io(e))?;
+    let mut central = central.clone();
+    if central.headers.get("Authorization").is_none() {
+        central
+            .headers
+            .insert("Authorization".to_string(), format!("Bearer {}", api_key));
+    }
+    sync_identity_from_session(&central)
+}
+
+pub fn logout() -> Result<(), LogMachineError> {
+    persist_lm_creds("", "", "").map_err(|e| LogMachineError::Io(e))?;
+    Ok(())
 }
 
 fn get_login() -> String {

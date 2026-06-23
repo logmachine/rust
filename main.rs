@@ -1,4 +1,4 @@
-use chrono::Local;
+use chrono::{Local, Utc};
 use log::{Level, LevelFilter, Log, Metadata, Record};
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -19,8 +19,12 @@ const COLOR_INFO: &str = "\x1b[34m";
 const COLOR_WARNING: &str = "\x1b[33m";
 const COLOR_ERROR: &str = "\x1b[31m";
 const COLOR_SUCCESS: &str = "\x1b[32m";
+const COLOR_CRITICAL: &str = "\x1b[41m";
 const COLOR_RESET: &str = "\x1b[0m";
 const COLOR_BOLD: &str = "\x1b[1m";
+
+const DEFAULT_LOG_FORMAT: &str = "({username} @ {module}) 🤌 CL Timing: {color}[ {timestamp} ]{reset}\n{level} {message}\n🏁";
+const DEFAULT_DATEFMT: &str = "%Y-%m-%dT%H:%M:%S";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LogEntry {
@@ -39,6 +43,8 @@ pub struct LogMachineOptions {
     pub verbose: bool,
     pub central: Option<CentralConfig>,
     pub attached: bool,
+    pub log_format: Option<String>,
+    pub datefmt: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +66,8 @@ impl Default for LogMachineOptions {
             verbose: false,
             central: None,
             attached: false,
+            log_format: None,
+            datefmt: None,
         }
     }
 }
@@ -70,6 +78,8 @@ pub enum LogMachineError {
     SetLogger(log::SetLoggerError),
     Http(reqwest::Error),
     Config(String),
+    DeviceFlow(String),
+    SocketIo(String),
 }
 
 impl std::fmt::Display for LogMachineError {
@@ -79,6 +89,8 @@ impl std::fmt::Display for LogMachineError {
             Self::SetLogger(err) => write!(f, "failed to set global logger: {err}"),
             Self::Http(err) => write!(f, "http error: {err}"),
             Self::Config(err) => write!(f, "config error: {err}"),
+            Self::DeviceFlow(err) => write!(f, "device flow error: {err}"),
+            Self::SocketIo(err) => write!(f, "socket.io error: {err}"),
         }
     }
 }
@@ -103,6 +115,12 @@ impl From<reqwest::Error> for LogMachineError {
     }
 }
 
+#[derive(Debug, Clone)]
+struct LevelStyle {
+    color: &'static str,
+    label: &'static str,
+}
+
 #[derive(Debug)]
 struct LogMachineState {
     debug_level: u8,
@@ -113,6 +131,11 @@ struct LogMachineState {
     allowed_map: HashMap<u8, Vec<String>>,
     log_file: File,
     error_file: File,
+    log_format: String,
+    datefmt: String,
+    custom_levels: HashMap<String, LevelStyle>,
+    #[cfg(feature = "socketio")]
+    socket_client: Option<Arc<Mutex<rust_socketio::RawClient>>>,
 }
 
 impl LogMachineState {
@@ -144,6 +167,23 @@ impl LogMachineState {
             None
         };
 
+        #[cfg(feature = "socketio")]
+        let socket_client = if let Some(central) = &options.central {
+            if central.socketio {
+                match connect_socketio(central) {
+                    Ok(client) => Some(Arc::new(Mutex::new(client))),
+                    Err(e) => {
+                        eprintln!("[logmachine] socket.io connection failed: {e}");
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             debug_level: options.debug_level,
             verbose: options.verbose,
@@ -153,6 +193,11 @@ impl LogMachineState {
             allowed_map,
             log_file,
             error_file,
+            log_format: options.log_format.unwrap_or_else(|| DEFAULT_LOG_FORMAT.to_string()),
+            datefmt: options.datefmt.unwrap_or_else(|| DEFAULT_DATEFMT.to_string()),
+            custom_levels: HashMap::new(),
+            #[cfg(feature = "socketio")]
+            socket_client,
         })
     }
 
@@ -169,14 +214,29 @@ impl LogMachineState {
         }
     }
 
-    fn level_color(level_name: &str) -> &'static str {
+    fn level_color(&self, level_name: &str) -> &'static str {
+        if let Some(style) = self.custom_levels.get(level_name) {
+            return style.color;
+        }
         match level_name {
             "DEBUG" => COLOR_DEBUG,
             "INFO" => COLOR_INFO,
             "WARN" => COLOR_WARNING,
             "ERROR" => COLOR_ERROR,
             "SUCCESS" => COLOR_SUCCESS,
+            "CRITICAL" => COLOR_CRITICAL,
             _ => COLOR_INFO,
+        }
+    }
+
+    fn level_label(&self, level_name: &str) -> String {
+        if let Some(style) = self.custom_levels.get(level_name) {
+            return format!("{COLOR_BOLD}{}[ {} ]{COLOR_RESET}", style.color, style.label);
+        }
+        let color = self.level_color(level_name);
+        match level_name {
+            "CRITICAL" => format!("{COLOR_BOLD}{color} CRITICAL {COLOR_RESET}"),
+            _ => format!("{COLOR_BOLD}{color}[ {level_name} ]{COLOR_RESET}"),
         }
     }
 
@@ -184,7 +244,6 @@ impl LogMachineState {
         if self.debug_level == 0 || self.verbose {
             return true;
         }
-
         if let Some(allowed) = self.allowed_map.get(&self.debug_level) {
             return allowed.iter().any(|l| l == level_name);
         }
@@ -192,20 +251,27 @@ impl LogMachineState {
     }
 
     fn format_log(&self, level_name: &str, message: &str, module_path: Option<&str>) -> String {
-        let username = env::var("CL_USERNAME").unwrap_or_else(|_| get_login());
-        let timestamp = Local::now().format("%Y-%m-%dT%H:%M:%S%:z").to_string();
+        let username = env::var("lm_username")
+            .or_else(|_| env::var("CL_USERNAME"))
+            .unwrap_or_else(|_| get_login());
+        let timestamp = Local::now().format(&self.datefmt).to_string();
         let parent_dir = module_path
             .and_then(|path| Path::new(path).parent())
             .and_then(|parent| parent.file_name())
             .and_then(|name| name.to_str())
             .unwrap_or("stdin");
 
-        let color = Self::level_color(level_name);
-        let level_fmt = format!("{COLOR_BOLD}{color}[ {level_name} ]{COLOR_RESET}");
+        let color = self.level_color(level_name);
+        let level_fmt = self.level_label(level_name);
 
-        format!(
-            "{COLOR_DEBUG}({username}{COLOR_RESET} @ {COLOR_WARNING}{parent_dir}{COLOR_RESET}) 🤌 CL Timing: {color}[ {timestamp} ]{COLOR_RESET}\n{level_fmt} {message}\n🏁"
-        )
+        self.log_format
+            .replace("{username}", &format!("{COLOR_DEBUG}{username}{COLOR_RESET}"))
+            .replace("{module}", &format!("{COLOR_WARNING}{parent_dir}{COLOR_RESET}"))
+            .replace("{color}", color)
+            .replace("{reset}", COLOR_RESET)
+            .replace("{timestamp}", &format!("{color}[ {timestamp} ]{COLOR_RESET}"))
+            .replace("{level}", &format!("{color}{level_fmt}{COLOR_RESET}"))
+            .replace("{message}", message)
     }
 
     fn write_log_entry(
@@ -228,6 +294,91 @@ impl LogMachineState {
         }
         Ok(formatted)
     }
+
+    #[cfg(feature = "socketio")]
+    fn emit_socketio(&self, formatted: &str) {
+        if let Some(socket) = &self.socket_client {
+            if let Some(central) = &self.central {
+                if let Some(entry) = parse_log(formatted) {
+                    let payload = serde_json::json!({
+                        "room": central.room,
+                        "data": {
+                            "user": entry.user,
+                            "module": entry.module,
+                            "level": entry.level,
+                            "timestamp": entry.timestamp,
+                            "message": entry.message,
+                        }
+                    });
+                    if let Ok(mut sock) = socket.lock() {
+                        let _ = sock.emit("log", payload);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(not(feature = "socketio"))]
+    fn emit_socketio(&self, _formatted: &str) {}
+}
+
+#[cfg(feature = "socketio")]
+fn connect_socketio(central: &CentralConfig) -> Result<rust_socketio::RawClient, LogMachineError> {
+    let url = central.url.trim_end_matches('/').to_string();
+    let socketio_path = if central.socketio_path.is_empty() {
+        "/api/socket.io/"
+    } else {
+        &central.socketio_path
+    };
+
+    let auth_token = env::var("lm_auth_token").unwrap_or_default();
+    let auth_value = serde_json::json!({"token": auth_token});
+
+    let callback = |payload: rust_socketio::Payload, _socket: rust_socketio::RawClient| {
+        if let rust_socketio::Payload::Text(values) = payload {
+            for value in values {
+                if let Some(data) = value.as_object() {
+                    let user = data.get("user").and_then(|v| v.as_str()).unwrap_or("unknown");
+                    let module = data.get("module").and_then(|v| v.as_str()).unwrap_or("unknown");
+                    let level = data.get("level").and_then(|v| v.as_str()).unwrap_or("INFO");
+                    let message = data.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                    let timestamp = data.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
+
+                    let username = env::var("lm_username")
+                        .or_else(|_| env::var("CL_USERNAME"))
+                        .unwrap_or_else(|_| get_login());
+
+                    let color = match level {
+                        "DEBUG" => COLOR_DEBUG,
+                        "INFO" => COLOR_INFO,
+                        "WARN" | "WARNING" => COLOR_WARNING,
+                        "ERROR" => COLOR_ERROR,
+                        "SUCCESS" => COLOR_SUCCESS,
+                        _ => COLOR_INFO,
+                    };
+
+                    println!(
+                        "{COLOR_DEBUG}({username}{COLOR_RESET} @ {COLOR_WARNING}{module}{COLOR_RESET}) 🤌 CL Timing: {color}[ {timestamp} ]{COLOR_RESET}\n{COLOR_BOLD}{color}[ {level} ]{COLOR_RESET} {message}"
+                    );
+                }
+            }
+        }
+    };
+
+    let socket = rust_socketio::ClientBuilder::new(url)
+        .namespace("/")
+        .on("log", callback)
+        .on("error", |err, _| {
+            eprintln!("[logmachine] socket.io error: {err:#?}");
+        })
+        .auth(auth_value)
+        .connect()
+        .map_err(|e| LogMachineError::SocketIo(format!("{e:#?}")))?;
+
+    let room = &central.room;
+    let _ = socket.emit("join", serde_json::json!({"room": room}));
+
+    Ok(socket)
 }
 
 #[derive(Debug)]
@@ -246,15 +397,17 @@ impl Log for LogMachineGlobalLogger {
             return;
         }
         let target = record.target();
-        if target.starts_with("reqwest")
+        let is_internal = target.starts_with("reqwest")
             || target.starts_with("hyper")
             || target.starts_with("h2")
             || target.starts_with("tokio")
             || target.starts_with("rustls")
             || target.starts_with("mio")
             || target.starts_with("want")
-            || target.starts_with("tower")
-        {
+            || target.starts_with("tower");
+        #[cfg(feature = "socketio")]
+        let is_internal = is_internal || target.starts_with("rust_socketio");
+        if is_internal {
             return;
         }
 
@@ -267,10 +420,12 @@ impl Log for LogMachineGlobalLogger {
                         .map(|m| m.trim_start())
                         .unwrap_or(raw_message.as_str());
                     let level_name = LogMachineState::level_name(record.level(), &raw_message);
-                    let central = state.central.clone();
-                    let central_client = state.central_client.clone();
-                    let attached = state.attached;
+
                     if let Ok(formatted) = state.write_log_entry(level_name, normalized_message, record.file()) {
+                        state.emit_socketio(&formatted);
+                        let central = state.central.clone();
+                        let central_client = state.central_client.clone();
+                        let attached = state.attached;
                         drop(state);
                         if let Err(err) = emit_central(central.as_ref(), central_client.as_ref(), attached, &formatted) {
                             eprintln!("[logmachine] transport error: {err}");
@@ -343,11 +498,10 @@ fn emit_central(
         let client = central_client.ok_or_else(|| {
             LogMachineError::Config("missing central HTTP client".to_string())
         })?;
-            let mut request = client.post(url).json(&log_data);
-            // Merge headers with potential lm_auth_token from credentials
-            for (key, value) in auth_headers(&central.headers).iter() {
-                request = request.header(key.as_str(), value.as_str());
-            }
+        let mut request = client.post(url).json(&log_data);
+        for (key, value) in auth_headers(&central.headers).iter() {
+            request = request.header(key.as_str(), value.as_str());
+        }
 
         let response = request.send()?;
         if !response.status().is_success() {
@@ -365,15 +519,23 @@ fn emit_central(
 
 pub fn init_global_logger(options: LogMachineOptions) -> Result<(), LogMachineError> {
     if let Some(central) = &options.central {
-        // Load persisted credentials into environment (if present)
-        for (k, v) in load_lm_creds().into_iter() {
-            if !v.is_empty() {
-                env::set_var(k, v);
-            }
-        }
+        creds_file_to_dict();
         resolve_username(&central.url);
-        // try to sync identity from session if token present
-        let _ = sync_identity_from_session(central);
+
+        let api_key = central.headers.get("API_KEY")
+            .or_else(|| central.headers.get("api_key"))
+            .or_else(|| central.headers.get("Authorization"))
+            .cloned();
+
+        let token = env::var("lm_auth_token").ok();
+        let expiry = env::var("lm_expiry").ok();
+        let has_valid_token = token.is_some() && expiry.is_some() && token_expiry_is_valid();
+
+        if let Some(key) = api_key {
+            let _ = login_with_api_key(central, key.trim_start_matches("Bearer ").trim());
+        } else if central.headers.contains_key("Authorization") || has_valid_token {
+            let _ = sync_identity_from_session(central);
+        }
     }
 
     let new_state = Arc::new(Mutex::new(LogMachineState::new(options)?));
@@ -401,6 +563,7 @@ pub fn parse_log(log_text: &str) -> Option<LogEntry> {
         Lazy::new(|| Regex::new(r"\[\s?(\w+)\s?\]\s?(.*)").expect("valid level regex"));
 
     let clean = ANSI_ESCAPE.replace_all(log_text.trim(), "");
+    let clean = clean.trim_end_matches('🏁').trim_end().to_string();
     let header = HEADER_RE.captures(&clean)?;
     let user = header.get(1)?.as_str().to_string();
     let module = header.get(2)?.as_str().to_string();
@@ -418,7 +581,7 @@ pub fn parse_log(log_text: &str) -> Option<LogEntry> {
             .unwrap_or_else(|| "UNKNOWN".to_string());
         let msg = caps
             .get(2)
-            .map(|m| m.as_str().replace('🏁', "").trim().to_string())
+            .map(|m| m.as_str().trim().to_string())
             .unwrap_or_default();
         (lvl, msg)
     } else {
@@ -454,11 +617,244 @@ pub fn jsonifier(log_file_path: &str) -> Result<Vec<String>, LogMachineError> {
     Ok(entries)
 }
 
+// --- Device Authorization Flow ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DeviceFlowResult {
+    token: String,
+    username: Option<String>,
+    provider: Option<String>,
+    expires_in: Option<u64>,
+}
+
+fn sdk_login_via_device_flow(central_url: &str, timeout_seconds: u64) -> Result<DeviceFlowResult, LogMachineError> {
+    let base = central_url.trim_end_matches('/');
+    let start_url = format!("{base}/api/auth/device/start");
+    let client = build_central_client(Duration::from_secs(10)).build()?;
+
+    let start_response = client
+        .post(&start_url)
+        .send()
+        .map_err(|e| LogMachineError::DeviceFlow(format!("failed to start device login: {e}")))?;
+
+    if !start_response.status().is_success() {
+        let text = start_response.text().unwrap_or_default();
+        return Err(LogMachineError::DeviceFlow(format!(
+            "failed to start device login flow: {text}"
+        )));
+    }
+
+    let payload: serde_json::Value = start_response
+        .json()
+        .map_err(|e| LogMachineError::DeviceFlow(format!("invalid device start response: {e}")))?;
+
+    let device_code = payload
+        .get("device_code")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| LogMachineError::DeviceFlow("device flow did not return device_code".to_string()))?
+        .to_string();
+    let verification_uri_complete = payload
+        .get("verification_uri_complete")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            LogMachineError::DeviceFlow("device flow did not return verification_uri_complete".to_string())
+        })?;
+    let user_code = payload.get("user_code").and_then(|v| v.as_str()).unwrap_or("");
+    let interval: u64 = payload
+        .get("interval")
+        .and_then(|v| v.as_str())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3)
+        .max(1);
+
+    let web_base = if let Some(stripped) = base.strip_suffix("/api") {
+        stripped
+    } else {
+        base
+    };
+
+    let fallback_url = if verification_uri_complete.starts_with("http") {
+        verification_uri_complete.to_string()
+    } else {
+        format!("{}/{}", web_base.trim_end_matches('/'), verification_uri_complete.trim_start_matches('/'))
+    };
+
+    let opened = open::that(&fallback_url).is_ok();
+    if !opened {
+        println!("Open this URL on any device to log in:");
+        println!("  {fallback_url}");
+    }
+
+    println!("To authenticate this device:");
+    println!("  1) Open: {verification_uri_complete}");
+    println!("  2) Enter code: {user_code} (if not auto-filled)");
+    println!("\x1b[1mNOTE: For a better experience, use an API KEY\x1b[0m\n");
+
+    let poll_url = format!("{base}/api/auth/device/poll");
+    let started_at = std::time::Instant::now();
+
+    while started_at.elapsed() < Duration::from_secs(timeout_seconds) {
+        let response = client
+            .post(&poll_url)
+            .json(&serde_json::json!({"device_code": device_code}))
+            .send()
+            .map_err(|e| LogMachineError::DeviceFlow(format!("device login polling failed: {e}")))?;
+
+        if !response.status().is_success() {
+            let text = response.text().unwrap_or_default();
+            return Err(LogMachineError::DeviceFlow(format!("device login polling failed: {text}")));
+        }
+
+        let result: serde_json::Value = response
+            .json()
+            .map_err(|e| LogMachineError::DeviceFlow(format!("invalid poll response: {e}")))?;
+
+        let status = result.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        if status == "approved" {
+            println!("Device login approved! Finalizing authentication...");
+            return Ok(DeviceFlowResult {
+                token: result
+                    .get("token")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| LogMachineError::DeviceFlow("login completed without token".to_string()))?
+                    .to_string(),
+                username: result.get("user").and_then(|u| u.get("username")).and_then(|v| v.as_str()).map(|s| s.to_string()),
+                provider: result.get("provider").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                expires_in: result.get("expires_in").and_then(|v| v.as_u64()),
+            });
+        }
+        if status == "expired" {
+            return Err(LogMachineError::DeviceFlow(
+                "login code expired before authentication completed".to_string(),
+            ));
+        }
+
+        std::thread::sleep(Duration::from_secs(interval));
+    }
+
+    Err(LogMachineError::DeviceFlow(
+        "timed out waiting for device login to complete".to_string(),
+    ))
+}
+
+// --- Public Authentication API ---
+
+fn do_device_login(central: &CentralConfig, timeout_seconds: u64) -> Result<(), LogMachineError> {
+    let result = sdk_login_via_device_flow(&central.url, timeout_seconds)?;
+    let token = result.token;
+    let username = result.username.as_deref().unwrap_or("");
+    let expiry = result
+        .expires_in
+        .map(|secs| {
+            (Utc::now() + chrono::Duration::seconds(secs as i64))
+                .format("%Y-%m-%dT%H:%M:%S%.f%:z")
+                .to_string()
+        })
+        .unwrap_or_default();
+    persist_lm_creds(username, &token, &expiry)?;
+    Ok(())
+}
+
+pub fn login(central: &CentralConfig, timeout_seconds: u64, api_key: Option<&str>) -> Result<(), LogMachineError> {
+    let direct_api_key = api_key.map(|s| s.to_string()).or_else(|| {
+        env::var("LM_API_KEY")
+            .or_else(|_| env::var("lm_api_key"))
+            .ok()
+            .filter(|v| !v.is_empty())
+    });
+
+    if let Some(ref key) = direct_api_key {
+        persist_lm_creds("", key, "").ok();
+        let mut central = central.clone();
+        if !central.headers.contains_key("Authorization") {
+            central
+                .headers
+                .insert("Authorization".to_string(), format!("Bearer {key}"));
+        }
+        sync_identity_from_session(&central)
+    } else if central.headers.contains_key("Authorization") || env::var("Authorization").is_ok() {
+        sync_identity_from_session(central)
+    } else if let Ok(token) = env::var("lm_auth_token") {
+        if !token.trim().is_empty() && token_expiry_is_valid() {
+            sync_identity_from_session(central)
+        } else {
+            do_device_login(central, timeout_seconds)
+        }
+    } else {
+        do_device_login(central, timeout_seconds)
+    }
+}
+
+// --- Custom Log Levels ---
+
+pub fn new_level(level_name: &str, level_num: u8, ansi_color: &str) -> Result<(), LogMachineError> {
+    let state_guard = LOGGER_STATE.read().map_err(|_| {
+        LogMachineError::Config("failed to acquire logger state lock".to_string())
+    })?;
+    let Some(shared_state) = state_guard.as_ref() else {
+        return Err(LogMachineError::Config("logger not initialized".to_string()));
+    };
+
+    let mut state = shared_state.lock().map_err(|_| {
+        LogMachineError::Config("failed to lock logger state".to_string())
+    })?;
+
+    if state.custom_levels.contains_key(level_name) {
+        return Err(LogMachineError::Config(format!(
+            "level '{level_name}' already exists"
+        )));
+    }
+
+    let static_color: &'static str = Box::leak(ansi_color.to_string().into_boxed_str());
+    let static_name: &'static str = Box::leak(level_name.to_string().into_boxed_str());
+
+    state.custom_levels.insert(
+        level_name.to_string(),
+        LevelStyle {
+            color: static_color,
+            label: static_name,
+        },
+    );
+
+    if state.debug_level > 0 && level_num < state.debug_level {
+        state.debug_level = level_num;
+    }
+
+    drop(state);
+    drop(state_guard);
+
+    let level_name_owned = level_name.to_string();
+    let _ = std::thread::spawn(move || {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            log::info!("{level_name_owned}: ");
+        }));
+    });
+
+    Ok(())
+}
+
 // --- Credential helpers ---
+
 fn lm_creds_file_path() -> std::path::PathBuf {
     let mut p = Path::new(&home_dir()).to_path_buf();
     p.push(".logmachine");
     p
+}
+
+fn creds_file_to_dict() {
+    let path = lm_creds_file_path();
+    if let Ok(s) = fs::read_to_string(&path) {
+        for line in s.lines() {
+            if let Some(idx) = line.find('=') {
+                let k = line[..idx].trim();
+                let v = line[idx + 1..].trim();
+                if !k.is_empty() {
+                    env::set_var(k, v);
+                }
+            }
+        }
+    }
+    env::set_var("LM_LOADED", "true");
 }
 
 fn load_lm_creds() -> HashMap<String, String> {
@@ -585,9 +981,9 @@ fn sync_identity_from_session(central: &CentralConfig) -> Result<(), LogMachineE
 }
 
 pub fn login_with_api_key(central: &CentralConfig, api_key: &str) -> Result<(), LogMachineError> {
-    persist_lm_creds("", api_key, "").map_err(|e| LogMachineError::Io(e))?;
+    persist_lm_creds("", api_key, "").map_err(LogMachineError::Io)?;
     let mut central = central.clone();
-    if central.headers.get("Authorization").is_none() {
+    if !central.headers.contains_key("Authorization") {
         central
             .headers
             .insert("Authorization".to_string(), format!("Bearer {}", api_key));
@@ -596,11 +992,24 @@ pub fn login_with_api_key(central: &CentralConfig, api_key: &str) -> Result<(), 
 }
 
 pub fn logout() -> Result<(), LogMachineError> {
-    persist_lm_creds("", "", "").map_err(|e| LogMachineError::Io(e))?;
+    persist_lm_creds("", "", "").map_err(LogMachineError::Io)?;
+    env::remove_var("lm_username");
+    env::remove_var("CL_USERNAME");
+    env::remove_var("lm_auth_token");
+    env::remove_var("lm_expiry");
+    println!("Logged out and cleared credentials.");
     Ok(())
 }
 
 fn get_login() -> String {
+    if env::var("LM_LOADED").as_deref() != Ok("true") {
+        creds_file_to_dict();
+    }
+    if let Ok(v) = env::var("lm_username") {
+        if !v.is_empty() {
+            return v;
+        }
+    }
     env::var("USER")
         .or_else(|_| env::var("USERNAME"))
         .unwrap_or_else(|_| "unknown".to_string())
@@ -718,6 +1127,8 @@ mod tests {
             verbose: false,
             central: None,
             attached: false,
+            log_format: None,
+            datefmt: None,
         }
     }
 
@@ -838,6 +1249,45 @@ mod tests {
         assert!(lower.contains("application/json"));
         assert!(lower.contains("x-test: token"));
         assert!(post_request.contains("central payload"));
+    }
+
+    #[test]
+    fn parse_log_strips_finish_emoji() {
+        let _guard = test_guard();
+        let sample = "\u{1b}[36m(test\u{1b}[0m @ \u{1b}[33mmod\u{1b}[0m) 🤌 CL Timing: \u{1b}[34m[ 2026-01-01T00:00:00+00:00 ]\u{1b}[0m\n\u{1b}[1m\u{1b}[34m[ INFO ]\u{1b}[0m msg with 🏁 inside\n🏁";
+        let parsed = parse_log(sample).expect("should parse");
+        assert_eq!(parsed.message, "msg with 🏁 inside");
+    }
+
+    #[test]
+    fn get_login_fallback_chain() {
+        let _guard = test_guard();
+        // prevent creds file from loading
+        env::set_var("LM_LOADED", "true");
+        env::remove_var("lm_username");
+        env::remove_var("CL_USERNAME");
+        // ensure no leftover USER from subprocess
+        env::set_var("USER", "testuser_fallback");
+        let login = get_login();
+        assert_eq!(login, "testuser_fallback");
+        env::remove_var("USER");
+        // LM_LOADED was set by us, not the creds file; clean up
+        env::set_var("LM_LOADED", "false");
+    }
+
+    #[test]
+    fn custom_log_format_is_used() {
+        let _guard = test_guard();
+        let mut opts = test_options();
+        opts.log_format = Some("CUSTOM: {message}".to_string());
+        let log_path = opts.log_file.clone();
+        init_global_logger(opts).expect("init logger");
+
+        log::info!("custom fmt");
+        log::logger().flush();
+
+        let data = read_file(&log_path);
+        assert!(data.contains("CUSTOM: custom fmt"));
     }
 
     fn read_http_request(stream: &mut std::net::TcpStream) -> String {

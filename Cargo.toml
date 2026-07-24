@@ -2,7 +2,7 @@
 name = "logmachine"
 version = "2.6.1"
 edition = "2021"
-description = "Collaborative, beautiful logging system for distributed developers"
+description = "Collective, beautiful logging system for distributed developers"
 license = "MIT"
 repository = "https://github.com/logmachine/rust"
 readme = "README.md"
